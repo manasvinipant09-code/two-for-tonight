@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabase";
-import { generateSearchBrief, refineSearchBrief } from "@/lib/claude";
+import { generateSearchBrief, refineSearchBrief } from "@/lib/gemini";
 import { fetchTitlesForBrief } from "@/lib/tmdb";
 import type { PreferenceProfile, PooledTitle } from "@/lib/types";
 

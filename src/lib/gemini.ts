@@ -1,18 +1,27 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI, Type } from "@google/genai";
 import { TMDB_GENRES, languagesToIso } from "./tmdb";
 import type { PreferenceProfile, PooledTitle, SearchBrief } from "./types";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-// Pick the model via env var so you can move to a newer one without a redeploy.
-// "claude-sonnet-5" is a strong, fast default for this kind of structured task.
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Flash is fast and cheap enough for a per-session structured-output call;
+// swap to a Pro model via env var if you want stronger reasoning on the brief.
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 const GENRE_LIST = Object.keys(TMDB_GENRES).join(", ");
 
-function extractJson(text: string): any {
-  const cleaned = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(cleaned);
-}
+// Structured output schema — Gemini enforces this shape directly, so unlike
+// a plain-text prompt we don't need to parse/repair JSON out of prose.
+const BRIEF_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    with_genres: { type: Type.ARRAY, items: { type: Type.INTEGER } },
+    without_genres: { type: Type.ARRAY, items: { type: Type.INTEGER } },
+    keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
+    sort_by: { type: Type.STRING },
+    rationale: { type: Type.STRING },
+  },
+  required: ["with_genres", "without_genres", "keywords", "sort_by", "rationale"],
+};
 
 function currentYear() {
   return new Date().getFullYear();
@@ -26,7 +35,6 @@ function eraToDateRange(eras: string[]): { gte: string | null; lte: string | nul
     if (e === "recent") return { gte: "2021-01-01", lte: `${currentYear()}-12-31` };
     return { gte: null, lte: null };
   });
-  // widest span covering all selected eras (TMDB discover only takes one range)
   const gtes = ranges.map((r) => r.gte).filter(Boolean) as string[];
   const ltes = ranges.map((r) => r.lte).filter(Boolean) as string[];
   return {
@@ -35,11 +43,24 @@ function eraToDateRange(eras: string[]): { gte: string | null; lte: string | nul
   };
 }
 
+async function callGemini(systemInstruction: string, userMsg: string): Promise<any> {
+  const resp = await ai.models.generateContent({
+    model: MODEL,
+    contents: userMsg,
+    config: {
+      systemInstruction,
+      responseMimeType: "application/json",
+      responseSchema: BRIEF_SCHEMA,
+    },
+  });
+  const text = resp.text ?? "{}";
+  return JSON.parse(text);
+}
+
 /**
  * Round 1: reads both partners' structured preferences AND free-text mood
  * descriptions, and produces a single TMDB search brief that satisfies both
- * — including nuance from the free text that no checkbox captures
- * ("something we can half-watch while eating" vs. "need to be gripped").
+ * — including nuance from the free text that no checkbox captures.
  */
 export async function generateSearchBrief(
   prefA: PreferenceProfile,
@@ -57,14 +78,13 @@ export async function generateSearchBrief(
   const includeSeries =
     prefA.contentType === "include_series" || prefB.contentType === "include_series";
 
-  const system = `You are the taste engine behind "Two for Tonight", a movie/TV matchmaker for couples/friends in India who can't agree what to watch. You read two independent, unseen-to-each-other preference profiles and translate them into ONE TMDB discover query brief that will satisfy both people simultaneously — not a compromise that bores both, but a genuine overlap in their actual tastes. Pay special attention to the free-text mood descriptions: they carry nuance the checkboxes can't (pacing, tone, what kind of night this is). Respond with ONLY a raw JSON object, no prose, no markdown fences, matching exactly this shape:
-{
-  "with_genres": [<TMDB genre ids, 1-4, from this list: ${GENRE_LIST}>],
-  "without_genres": [<TMDB genre ids to actively exclude, 0-3>],
-  "keywords": [<3-6 short free-text mood/tone keywords blending both free-text descriptions, e.g. "slow burn", "edge of seat", "comfort watch">],
-  "sort_by": "<one of popularity.desc, vote_average.desc, primary_release_date.desc>",
-  "rationale": "<one sentence, plain language, explaining the overlap you found between the two people>"
-}`;
+  const system = `You are the taste engine behind "Two for Tonight", a movie/TV matchmaker for couples/friends in India who can't agree what to watch. You read two independent, unseen-to-each-other preference profiles and translate them into ONE TMDB discover query brief that will satisfy both people simultaneously — not a compromise that bores both, but a genuine overlap in their actual tastes. Pay special attention to the free-text mood descriptions: they carry nuance the checkboxes can't (pacing, tone, what kind of night this is).
+
+with_genres: 1-4 TMDB genre ids from this list: ${GENRE_LIST}
+without_genres: 0-3 ids to actively exclude
+keywords: 3-6 short mood/tone keywords blending both free-text descriptions
+sort_by: one of popularity.desc, vote_average.desc, primary_release_date.desc
+rationale: one sentence, plain language, on the overlap you found between the two people`;
 
   const userMsg = `PARTNER A
 - Mood tags: ${prefA.mood.join(", ") || "none"}
@@ -89,15 +109,7 @@ ${
 
 Produce the brief.`;
 
-  const resp = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 500,
-    system,
-    messages: [{ role: "user", content: userMsg }],
-  });
-
-  const text = resp.content.find((b) => b.type === "text")?.text ?? "{}";
-  const parsed = extractJson(text);
+  const parsed = await callGemini(system, userMsg);
 
   return {
     media_types: includeSeries ? ["movie", "tv"] : ["movie"],
@@ -116,10 +128,8 @@ Produce the brief.`;
 /**
  * Round 2 (and beyond): no mutual match in round 1. Reads BOTH partners'
  * right-swipe lists from the round just finished and generates a brief that
- * leans into what each of them actually reached for — not just what they
- * said in the form — while staying inside the original hard constraints
- * (rating floor, language, era) so the refinement never drifts into content
- * neither of them asked for.
+ * leans into what each of them actually reached for, while staying inside
+ * the original hard constraints (rating floor, language, era).
  */
 export async function refineSearchBrief(
   previousBrief: SearchBrief,
@@ -128,14 +138,13 @@ export async function refineSearchBrief(
   leftSwipesA: PooledTitle[],
   leftSwipesB: PooledTitle[]
 ): Promise<SearchBrief> {
-  const system = `You are refining a movie/TV search brief for "Two for Tonight" after a first round of swiping produced no mutual match. You will see what each partner swiped right and left on. Find the pattern in what each of them reached for — genre, tone, pace — and adjust the brief to surface more titles like their right-swipes and fewer like their left-swipes, while staying within the same rating/language/era constraints. Respond with ONLY a raw JSON object, no prose:
-{
-  "with_genres": [<TMDB genre ids, from this list: ${GENRE_LIST}>],
-  "without_genres": [<ids to exclude>],
-  "keywords": [<3-6 short mood/tone keywords>],
-  "sort_by": "<popularity.desc | vote_average.desc | primary_release_date.desc>",
-  "rationale": "<one sentence on what you noticed and adjusted>"
-}`;
+  const system = `You are refining a movie/TV search brief for "Two for Tonight" after a first round of swiping produced no mutual match. You will see what each partner swiped right and left on. Find the pattern in what each of them reached for — genre, tone, pace — and adjust the brief to surface more titles like their right-swipes and fewer like their left-swipes, while staying within the same rating/language/era constraints.
+
+with_genres: TMDB genre ids from this list: ${GENRE_LIST}
+without_genres: ids to exclude
+keywords: 3-6 short mood/tone keywords
+sort_by: popularity.desc | vote_average.desc | primary_release_date.desc
+rationale: one sentence on what you noticed and adjusted`;
 
   const describe = (list: PooledTitle[]) =>
     list.map((t) => `${t.title} (${t.year ?? "?"})`).join(", ") || "none";
@@ -149,15 +158,7 @@ Partner B left-swiped: ${describe(leftSwipesB)}
 
 Neither partner right-swiped the same title, so no match yet. Adjust the brief to find the overlap between what A and B are each individually drawn to.`;
 
-  const resp = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 500,
-    system,
-    messages: [{ role: "user", content: userMsg }],
-  });
-
-  const text = resp.content.find((b) => b.type === "text")?.text ?? "{}";
-  const parsed = extractJson(text);
+  const parsed = await callGemini(system, userMsg);
 
   return {
     ...previousBrief,
